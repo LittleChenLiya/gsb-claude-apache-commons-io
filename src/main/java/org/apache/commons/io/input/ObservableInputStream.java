@@ -38,6 +38,24 @@ import org.apache.commons.io.function.IOConsumer;
  * aren't. If you must access the stream from multiple threads, then synchronization, locking, or a similar means must
  * be used.
  * </p>
+ * <h2>Observer strategy</h2>
+ * <ul>
+ * <li>Observer callbacks are invoked only after the internal state has been settled: a notification reports the final
+ * outcome (data, EOF, or error) of the underlying read, and the bytes of each read are delivered to observers exactly
+ * once.</li>
+ * <li>EOF ({@link Observer#finished()}) and close ({@link Observer#closed()}) are distinct events: reaching EOF
+ * notifies {@code finished()} once per EOF-returning read, never {@code closed()}, and the underlying stream is not
+ * closed as a side effect of EOF. Only an explicit {@link #close()} closes the underlying stream and notifies
+ * {@code closed()}.</li>
+ * <li>Notifications iterate over a snapshot of the observer list, so {@link #remove(Observer)} and
+ * {@link #removeAllObservers()} have a deterministic boundary: they only affect events notified after the removal,
+ * never the notification round currently in progress. Callbacks may safely reenter {@link #getObservers()},
+ * {@link #add(Observer)}, {@link #remove(Observer)}, and {@link #removeAllObservers()} without risking a deadlock or
+ * a {@link java.util.ConcurrentModificationException}.</li>
+ * <li>If the underlying stream fails and observers also fail, the original exception is the one thrown and observer
+ * failures are available as {@link Throwable#getSuppressed() suppressed} exceptions on it. Failures of multiple
+ * observers are aggregated the same way: the first observer failure is thrown, the others are suppressed on it.</li>
+ * </ul>
  *
  * @see MessageDigestInputStream
  */
@@ -167,7 +185,7 @@ public class ObservableInputStream extends ProxyInputStream {
 
     ObservableInputStream(final AbstractBuilder<?> builder) throws IOException {
         super(builder);
-        this.observers = builder.observers;
+        this.observers = builder.observers != null ? builder.observers : new ArrayList<>();
     }
 
     /**
@@ -203,6 +221,10 @@ public class ObservableInputStream extends ProxyInputStream {
 
     /**
      * Adds an Observer.
+     * <p>
+     * The addition has a deterministic boundary: it only affects events notified after this call, never the
+     * notification round currently in progress.
+     * </p>
      *
      * @param observer The observer to add.
      */
@@ -234,8 +256,31 @@ public class ObservableInputStream extends ProxyInputStream {
         IOUtils.consume(this);
     }
 
+    /**
+     * Applies the given action to a snapshot of the current observers, so that observers added or removed by a
+     * callback only affect subsequent events. All observers present in the snapshot are notified, even if some fail:
+     * observer failures are aggregated by throwing the first failure with the others added as
+     * {@link Throwable#getSuppressed() suppressed} exceptions.
+     *
+     * @param action The action to apply to each observer.
+     * @throws IOException The first observer failure, with any further failures suppressed on it.
+     */
     private void forEachObserver(final IOConsumer<Observer> action) throws IOException {
-        IOConsumer.forAll(action, observers);
+        IOException thrown = null;
+        for (final Observer observer : getObservers()) {
+            try {
+                action.accept(observer);
+            } catch (final IOException e) {
+                if (thrown == null) {
+                    thrown = e;
+                } else if (thrown != e) {
+                    thrown.addSuppressed(e);
+                }
+            }
+        }
+        if (thrown != null) {
+            throw thrown;
+        }
     }
 
     /**
@@ -284,7 +329,8 @@ public class ObservableInputStream extends ProxyInputStream {
      *
      * @param exception Passed to the observers.
      * @throws IOException Some observer has thrown an exception, which is being passed down. This may be the same
-     *         exception, which has been passed as an argument.
+     *         exception, which has been passed as an argument. If several observers fail, the first failure is
+     *         thrown and the others are added to it as {@link Throwable#getSuppressed() suppressed} exceptions.
      */
     protected void noteError(final IOException exception) throws IOException {
         forEachObserver(observer -> observer.error(exception));
@@ -301,14 +347,33 @@ public class ObservableInputStream extends ProxyInputStream {
 
     private void notify(final byte[] buffer, final int offset, final int result, final IOException ioe) throws IOException {
         if (ioe != null) {
-            noteError(ioe);
-            throw ioe;
+            throw notifyError(ioe);
         }
         if (result == EOF) {
             noteFinished();
         } else if (result > 0) {
             noteDataBytes(buffer, offset, result);
         }
+    }
+
+    /**
+     * Notifies the observers of an error from the underlying stream, keeping the original exception as the one to
+     * throw: observer failures are added to it as {@link Throwable#getSuppressed() suppressed} exceptions, so both
+     * the underlying failure and the observer failures remain queryable.
+     *
+     * @param ioe The exception thrown by the underlying stream.
+     * @return The original exception, with any distinct observer failures suppressed on it.
+     */
+    private IOException notifyError(final IOException ioe) {
+        try {
+            noteError(ioe);
+        } catch (final IOException observerException) {
+            // The default Observer.error(IOException) rethrows the passed exception; only aggregate distinct failures.
+            if (observerException != ioe) {
+                ioe.addSuppressed(observerException);
+            }
+        }
+        return ioe;
     }
 
     @Override
@@ -321,8 +386,7 @@ public class ObservableInputStream extends ProxyInputStream {
             ioe = ex;
         }
         if (ioe != null) {
-            noteError(ioe);
-            throw ioe;
+            throw notifyError(ioe);
         }
         if (result == EOF) {
             noteFinished();
@@ -360,6 +424,10 @@ public class ObservableInputStream extends ProxyInputStream {
 
     /**
      * Removes an Observer.
+     * <p>
+     * The removal has a deterministic boundary: it only affects events notified after this call, never the
+     * notification round currently in progress.
+     * </p>
      *
      * @param observer The observer to remove.
      */
@@ -369,6 +437,10 @@ public class ObservableInputStream extends ProxyInputStream {
 
     /**
      * Removes all Observers.
+     * <p>
+     * The removal has a deterministic boundary: it only affects events notified after this call, never the
+     * notification round currently in progress.
+     * </p>
      */
     public void removeAllObservers() {
         observers.clear();

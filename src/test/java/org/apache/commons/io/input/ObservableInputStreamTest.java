@@ -16,9 +16,12 @@
  */
 package org.apache.commons.io.input;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertThrowsExactly;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -28,6 +31,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.commons.io.IOUtils;
@@ -131,6 +137,20 @@ class ObservableInputStreamTest {
             return finishedCount;
         }
 
+    }
+
+    private static final class CloseTrackingInputStream extends ByteArrayInputStream {
+        private boolean closed;
+
+        CloseTrackingInputStream(final byte[] buffer) {
+            super(buffer);
+        }
+
+        @Override
+        public void close() throws IOException {
+            closed = true;
+            super.close();
+        }
     }
 
     private ObservableInputStream brokenObservableInputStream() {
@@ -384,6 +404,165 @@ class ObservableInputStreamTest {
             // ChannelInputStream throws when closed
             assertThrows(IOException.class, in::read);
         }
+    }
+
+    /**
+     * Tests that the default {@link Observer} implementation rethrows the original read error unchanged.
+     */
+    @Test
+    void testDefaultObserverRethrowsOriginalReadError() {
+        final IOException readException = new IOException("underlying read failure");
+        final ObservableInputStream ois = new ObservableInputStream(new BrokenInputStream(readException), new Observer() {
+            // default behavior
+        });
+        final IOException thrown = assertThrows(IOException.class, ois::read);
+        assertSame(readException, thrown);
+        assertEquals(0, thrown.getSuppressed().length);
+    }
+
+    /**
+     * Tests that failures of several observers are aggregated as independent causes: the first failure is thrown,
+     * the others are suppressed on it, and all observers are still notified.
+     */
+    @Test
+    void testObserverFailuresAggregatedAsSuppressedCauses() throws Exception {
+        final IOException failure1 = new IOException("observer 1 failure");
+        final IOException failure2 = new IOException("observer 2 failure");
+        final Observer observer1 = new Observer() {
+            @Override
+            public void data(final int value) throws IOException {
+                throw failure1;
+            }
+        };
+        final Observer observer2 = new Observer() {
+            @Override
+            public void data(final int value) throws IOException {
+                throw failure2;
+            }
+        };
+        final MethodCountObserver stillNotified = new MethodCountObserver();
+        try (ObservableInputStream ois = new ObservableInputStream(new ByteArrayInputStream(new byte[] { 1 }), observer1, observer2, stillNotified)) {
+            final IOException thrown = assertThrows(IOException.class, ois::read);
+            assertSame(failure1, thrown);
+            assertArrayEquals(new Throwable[] { failure2 }, thrown.getSuppressed());
+            assertEquals(1, stillNotified.getDataCount());
+        }
+    }
+
+    /**
+     * Tests that the original read error takes priority over an observer failure: the read error is thrown and the
+     * observer failure is queryable as a suppressed exception, for all three read methods.
+     */
+    @Test
+    void testReadErrorTakesPriorityOverObserverError() {
+        final IOException observerException = new IOException("observer failure");
+        final Observer failingObserver = new Observer() {
+            @Override
+            public void error(final IOException exception) throws IOException {
+                throw observerException;
+            }
+        };
+        final IOException readException1 = new IOException("underlying read failure");
+        IOException thrown = assertThrows(IOException.class,
+            () -> new ObservableInputStream(new BrokenInputStream(readException1), failingObserver).read());
+        assertSame(readException1, thrown);
+        assertArrayEquals(new Throwable[] { observerException }, thrown.getSuppressed());
+        final IOException readException2 = new IOException("underlying read failure");
+        thrown = assertThrows(IOException.class,
+            () -> new ObservableInputStream(new BrokenInputStream(readException2), failingObserver).read(new byte[1]));
+        assertSame(readException2, thrown);
+        assertArrayEquals(new Throwable[] { observerException }, thrown.getSuppressed());
+        final IOException readException3 = new IOException("underlying read failure");
+        thrown = assertThrows(IOException.class,
+            () -> new ObservableInputStream(new BrokenInputStream(readException3), failingObserver).read(new byte[1], 0, 1));
+        assertSame(readException3, thrown);
+        assertArrayEquals(new Throwable[] { observerException }, thrown.getSuppressed());
+    }
+
+    /**
+     * Tests that reentrant state queries and mutations from within a callback neither deadlock nor break the
+     * notification round in progress.
+     */
+    @Test
+    void testReentrantStateQueryFromCallback() throws Exception {
+        final ObservableInputStream ois = new ObservableInputStream(new ByteArrayInputStream(new byte[] { 1, 2 }));
+        final AtomicBoolean queried = new AtomicBoolean();
+        final Observer reentrant = new Observer() {
+            @Override
+            public void data(final int value) {
+                queried.set(ois.getObservers().contains(this));
+                ois.removeAllObservers();
+            }
+        };
+        ois.add(reentrant);
+        assertEquals(1, ois.read());
+        assertTrue(queried.get());
+        assertTrue(ois.getObservers().isEmpty());
+        // Removal took effect after the notifying event: no observer sees the next read.
+        assertEquals(2, ois.read());
+        ois.close();
+    }
+
+    /**
+     * Tests that removing an observer from within a callback has a deterministic boundary: the removed observer
+     * still receives the event of the notification round in progress, but no events afterwards.
+     */
+    @Test
+    void testRemoveHasDeterministicBoundary() throws Exception {
+        final DataViewObserver removed = new DataViewObserver();
+        final ObservableInputStream ois = new ObservableInputStream(new ByteArrayInputStream(new byte[] { 1, 2, 3 }));
+        final Observer remover = new Observer() {
+            @Override
+            public void data(final int value) {
+                ois.remove(removed);
+            }
+        };
+        ois.add(remover);
+        ois.add(removed);
+        assertEquals(1, ois.read());
+        assertEquals(1, removed.lastValue, "snapshot of the round in progress still includes the removed observer");
+        assertEquals(2, ois.read());
+        assertEquals(1, removed.lastValue, "removal only affects events after the removing callback");
+        assertEquals(3, ois.read());
+        assertEquals(1, removed.lastValue);
+        ois.close();
+    }
+
+    /**
+     * Tests the explicit observer strategy on three read events: data, data, EOF. Each read delivers its byte
+     * exactly once, EOF is notified as {@code finished()} and is not {@code closed()}, and the borrowed underlying
+     * stream is not closed at EOF.
+     */
+    @Test
+    void testThreeReadEventsEofIsNotClose() throws Exception {
+        final CloseTrackingInputStream underlying = new CloseTrackingInputStream(new byte[] { 1, 2 });
+        final List<String> events = new ArrayList<>();
+        final Observer recorder = new Observer() {
+            @Override
+            public void closed() {
+                events.add("closed");
+            }
+
+            @Override
+            public void data(final int value) {
+                events.add("data(" + value + ")");
+            }
+
+            @Override
+            public void finished() {
+                events.add("finished");
+            }
+        };
+        final ObservableInputStream ois = new ObservableInputStream(underlying, recorder);
+        assertEquals(1, ois.read());
+        assertEquals(2, ois.read());
+        assertEquals(IOUtils.EOF, ois.read());
+        // Three read events: two data callbacks, one EOF callback; EOF is not close.
+        assertEquals(Arrays.asList("data(1)", "data(2)", "finished"), events);
+        assertFalse(underlying.closed, "EOF must not close the borrowed underlying stream");
+        ois.close();
+        assertEquals(Arrays.asList("data(1)", "data(2)", "finished", "closed"), events);
+        assertTrue(underlying.closed);
     }
 
 }
