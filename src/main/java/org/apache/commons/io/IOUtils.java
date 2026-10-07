@@ -61,7 +61,6 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import java.util.zip.InflaterInputStream;
 
-import org.apache.commons.io.channels.FileChannels;
 import org.apache.commons.io.function.IOConsumer;
 import org.apache.commons.io.function.IOSupplier;
 import org.apache.commons.io.function.IOTriFunction;
@@ -86,6 +85,7 @@ import org.apache.commons.io.output.UnsynchronizedByteArrayOutputStream;
  * <li>write - these methods write data to a stream</li>
  * <li>copy - these methods copy all the data from one stream to another</li>
  * <li>contentEquals - these methods compare the content of two streams</li>
+ * <li>firstDifference - finds the first difference between the content of two streams</li>
  * </ul>
  * <p>
  * The byte-to-char methods and char-to-byte methods involve a conversion step. Two methods are provided in each case, one that uses the platform default
@@ -1219,7 +1219,7 @@ public class IOUtils {
     /**
      * Compares the contents of two Streams to determine if they are equal or not.
      * <p>
-     * This method buffers the input internally using {@link BufferedInputStream} if they are not already buffered.
+     * This method delegates to {@link #firstDifference(InputStream, InputStream)} and buffers the input internally.
      * </p>
      *
      * @param input1 The first stream.
@@ -1227,7 +1227,6 @@ public class IOUtils {
      * @return true if the content of the streams are equal or they both don't. exist, false otherwise.
      * @throws IOException Thrown if an I/O error occurs.
      */
-    @SuppressWarnings("resource") // Caller closes input streams
     public static boolean contentEquals(final InputStream input1, final InputStream input2) throws IOException {
         // Before making any changes, please test with org.apache.commons.io.jmh.IOUtilsContentEqualsInputStreamsBenchmark
         if (input1 == input2) {
@@ -1236,8 +1235,133 @@ public class IOUtils {
         if (input1 == null || input2 == null) {
             return false;
         }
-        // We do not close FileChannels because that closes the owning InputStream.
-        return FileChannels.contentEquals(Channels.newChannel(input1), Channels.newChannel(input2), DEFAULT_BUFFER_SIZE);
+        return firstDifference(input1, input2).isEqual();
+    }
+
+    /**
+     * Finds the first difference between the contents of two InputStreams.
+     * <p>
+     * This method reads both streams in chunks and tolerates streams that perform short reads of different sizes; only the byte
+     * values are compared, not the read fragmentation. The result reports the zero-based byte offset of the first difference along
+     * with the byte value from each stream at that offset, where {@link StreamDifference#EOF} marks a stream that was already
+     * exhausted because its content is shorter.
+     * </p>
+     * <p>
+     * This method does not close either stream; callers remain responsible for closing them. A {@code null} stream is treated as
+     * immediately exhausted. If reading a stream fails, a {@link StreamReadException} is thrown recording which side failed and
+     * preserving the original exception as its cause.
+     * </p>
+     *
+     * @param input1 The first stream.
+     * @param input2 The second stream.
+     * @return The first difference found, or {@link StreamDifference#equal()} if the contents are equal.
+     * @throws StreamReadException Thrown if reading either stream fails; {@link StreamReadException#getSide()} identifies the
+     *         failing stream.
+     * @since 2.23.0
+     */
+    public static StreamDifference firstDifference(final InputStream input1, final InputStream input2) throws IOException {
+        if (input1 == input2) {
+            return StreamDifference.equal();
+        }
+        if (input1 == null) {
+            return firstDifferenceAgainstNull(input2, StreamReadException.Side.INPUT_2);
+        }
+        if (input2 == null) {
+            return firstDifferenceAgainstNull(input1, StreamReadException.Side.INPUT_1);
+        }
+        final byte[] buffer1 = new byte[DEFAULT_BUFFER_SIZE];
+        final byte[] buffer2 = new byte[DEFAULT_BUFFER_SIZE];
+        long offset = 0;
+        int pos1 = 0;
+        int len1 = 0;
+        int pos2 = 0;
+        int len2 = 0;
+        boolean eof1 = false;
+        boolean eof2 = false;
+        while (true) {
+            if (pos1 == len1 && !eof1) {
+                len1 = readChunk(input1, buffer1, StreamReadException.Side.INPUT_1);
+                pos1 = 0;
+                if (len1 == StreamDifference.EOF) {
+                    eof1 = true;
+                    len1 = 0;
+                }
+            }
+            if (pos2 == len2 && !eof2) {
+                len2 = readChunk(input2, buffer2, StreamReadException.Side.INPUT_2);
+                pos2 = 0;
+                if (len2 == StreamDifference.EOF) {
+                    eof2 = true;
+                    len2 = 0;
+                }
+            }
+            final int avail1 = len1 - pos1;
+            final int avail2 = len2 - pos2;
+            if (avail1 == 0 || avail2 == 0) {
+                if (avail1 == 0 && avail2 == 0) {
+                    return StreamDifference.equal();
+                }
+                // One side is exhausted: report its EOF marker against the other side's next byte.
+                return StreamDifference.of(offset, avail1 == 0 ? StreamDifference.EOF : buffer1[pos1] & 0xff,
+                    avail2 == 0 ? StreamDifference.EOF : buffer2[pos2] & 0xff);
+            }
+            final int count = Math.min(avail1, avail2);
+            for (int i = 0; i < count; i++) {
+                if (buffer1[pos1 + i] != buffer2[pos2 + i]) {
+                    return StreamDifference.of(offset + i, buffer1[pos1 + i] & 0xff, buffer2[pos2 + i] & 0xff);
+                }
+            }
+            pos1 += count;
+            pos2 += count;
+            offset += count;
+        }
+    }
+
+    /**
+     * Computes the first difference between an exhausted (EOF) stream and a non-null stream.
+     *
+     * @param input The non-null stream.
+     * @param inputSide The side of the non-null stream, used to tag read failures.
+     * @return The first difference.
+     * @throws StreamReadException Thrown if reading the stream fails.
+     */
+    private static StreamDifference firstDifferenceAgainstNull(final InputStream input, final StreamReadException.Side inputSide)
+        throws IOException {
+        final int value = readByte(input, inputSide);
+        if (value == StreamDifference.EOF) {
+            return StreamDifference.equal();
+        }
+        return inputSide == StreamReadException.Side.INPUT_1 ? StreamDifference.of(0, value, StreamDifference.EOF)
+            : StreamDifference.of(0, StreamDifference.EOF, value);
+    }
+
+    /**
+     * Reads a single byte, tagging any failure with the given side.
+     */
+    private static int readByte(final InputStream input, final StreamReadException.Side side) throws IOException {
+        try {
+            return input.read();
+        } catch (final IOException e) {
+            throw new StreamReadException(side, e);
+        }
+    }
+
+    /**
+     * Reads the next chunk into the buffer, tagging any failure with the given side.
+     *
+     * @return The number of bytes read, or -1 on end-of-stream.
+     */
+    private static int readChunk(final InputStream input, final byte[] buffer, final StreamReadException.Side side)
+        throws IOException {
+        try {
+            int read;
+            do {
+                read = input.read(buffer);
+            } while (read == 0); // Guard against non-compliant streams returning 0.
+            return read;
+        } catch (final IOException e) {
+            throw new StreamReadException(side, e);
+        }
     }
 
     // TODO Consider making public
