@@ -17,6 +17,7 @@
 package org.apache.commons.io.input;
 
 import static org.apache.commons.io.IOUtils.EOF;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -34,7 +35,9 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
 
 import org.apache.commons.io.IOUtils;
@@ -123,6 +126,28 @@ class BoundedInputStreamTest {
         for (int i = 0; i < expected.length; i++) {
             mi.setValue(i);
             assertEquals(expected[i], actual[i], () -> message + " byte[" + mi + "]");
+        }
+    }
+
+    /**
+     * Memory-backed stream that counts how many times {@link #close()} has been invoked.
+     */
+    private static final class CloseCountingInputStream extends ProxyInputStream {
+
+        private final AtomicInteger closeCount = new AtomicInteger();
+
+        private CloseCountingInputStream(final byte[] data) {
+            super(new ByteArrayInputStream(data));
+        }
+
+        @Override
+        public void close() throws IOException {
+            closeCount.incrementAndGet();
+            super.close();
+        }
+
+        int getCloseCount() {
+            return closeCount.get();
         }
     }
 
@@ -748,6 +773,152 @@ class BoundedInputStreamTest {
             compare("limit < length", hello, IOUtils.toByteArray(bounded));
             // should be invariant
             assertTrue(bounded.markSupported());
+        }
+    }
+
+    @Test
+    void testRetainRemainingBuilder() throws Exception {
+        // Opting in never closes the borrowed stream, even when the builder asks to propagate.
+        try (BoundedInputStream bounded = BoundedInputStream.builder()
+                .setByteArray(new byte[] { 1, 2, 3 })
+                .setMaxCount(3)
+                .setPropagateClose(true)
+                .setRetainRemaining(true)
+                .get()) {
+            assertTrue(bounded.isRetainRemaining());
+            assertFalse(bounded.isPropagateClose());
+        }
+        // The default remains the classic behavior.
+        try (BoundedInputStream bounded = BoundedInputStream.builder()
+                .setByteArray(new byte[] { 1, 2, 3 })
+                .setMaxCount(3)
+                .get()) {
+            assertFalse(bounded.isRetainRemaining());
+            assertTrue(bounded.isPropagateClose());
+            assertThrows(UnsupportedOperationException.class, bounded::isOverLimit);
+            assertThrows(UnsupportedOperationException.class, bounded::getRemainingStream);
+        }
+    }
+
+    @Test
+    void testRetainRemainingCloseDoesNotCloseUnderlying() throws Exception {
+        final byte[] data = { 1, 2, 3, 4 };
+        final CloseCountingInputStream counting = new CloseCountingInputStream(data);
+        final BoundedInputStream bounded = BoundedInputStream.builder()
+                .setInputStream(counting)
+                .setMaxCount(3)
+                .setRetainRemaining(true)
+                .get();
+        assertArrayEquals(new byte[] { 1, 2, 3 }, IOUtils.toByteArray(bounded));
+        assertTrue(bounded.isOverLimit());
+        // Close neither the bounded stream nor the remaining view closes the borrowed stream.
+        try (InputStream remaining = bounded.getRemainingStream()) {
+            assertEquals(4, remaining.read());
+            assertEquals(EOF, remaining.read());
+        }
+        bounded.close();
+        assertEquals(0, counting.getCloseCount());
+        // The borrowed stream is still usable afterwards.
+        assertEquals(0, counting.available());
+    }
+
+    @Test
+    void testRetainRemainingMarkResetRestoresDetection() throws Exception {
+        final byte[] data = { 1, 2, 3, 4 };
+        try (BoundedInputStream bounded = BoundedInputStream.builder()
+                .setInputStream(new ByteArrayInputStream(data))
+                .setMaxCount(3)
+                .setRetainRemaining(true)
+                .get()) {
+            bounded.mark(4);
+            assertArrayEquals(new byte[] { 1, 2, 3 }, IOUtils.toByteArray(bounded));
+            assertTrue(bounded.isOverLimit());
+            try (InputStream remaining = bounded.getRemainingStream()) {
+                assertEquals(4, remaining.read());
+            }
+            // reset restores the count and the probed byte detection state.
+            bounded.reset();
+            assertEquals(0, bounded.getCount());
+            assertArrayEquals(new byte[] { 1, 2, 3 }, IOUtils.toByteArray(bounded));
+            assertTrue(bounded.isOverLimit(), "over-limit detection state restored after reset");
+            try (InputStream remaining = bounded.getRemainingStream()) {
+                assertArrayEquals(new byte[] { 4 }, IOUtils.toByteArray(remaining));
+            }
+            // A mark taken before probing must restore the "not probed yet" state.
+            bounded.reset();
+            bounded.mark(4);
+            assertArrayEquals(new byte[] { 1, 2, 3 }, IOUtils.toByteArray(bounded));
+            assertTrue(bounded.isOverLimit());
+            bounded.reset();
+            assertFalse(bounded.isOverLimit(), "reset to a mark taken before detection probes again");
+        }
+    }
+
+    @Test
+    void testRetainRemainingNotOverLimit() throws Exception {
+        final byte[] data = { 1, 2, 3 };
+        try (BoundedInputStream bounded = BoundedInputStream.builder()
+                .setInputStream(new ByteArrayInputStream(data))
+                .setMaxCount(3)
+                .setRetainRemaining(true)
+                .get()) {
+            assertArrayEquals(data, IOUtils.toByteArray(bounded));
+            assertFalse(bounded.isOverLimit());
+            try (InputStream remaining = bounded.getRemainingStream()) {
+                assertEquals(EOF, remaining.read());
+            }
+        }
+    }
+
+    @Test
+    void testRetainRemainingOverLimitSingleReads() throws Exception {
+        final byte[] data = { 1, 2, 3, 4 };
+        try (BoundedInputStream bounded = BoundedInputStream.builder()
+                .setInputStream(new ByteArrayInputStream(data))
+                .setMaxCount(3)
+                .setRetainRemaining(true)
+                .get()) {
+            // Before the limit is reached, isOverLimit() does not probe ahead.
+            assertFalse(bounded.isOverLimit());
+            for (int i = 1; i <= 3; i++) {
+                assertEquals(i, bounded.read());
+            }
+            assertEquals(3, bounded.getCount());
+            assertEquals(0, bounded.getRemaining());
+            // The boundary read probes one byte past the limit.
+            assertEquals(EOF, bounded.read());
+            assertTrue(bounded.isOverLimit());
+            // The probed byte (and nothing more) is returned by the remaining stream.
+            try (InputStream remaining = bounded.getRemainingStream()) {
+                assertEquals(4, remaining.read());
+                assertEquals(EOF, remaining.read());
+            }
+            // The bounded stream itself still behaves as exhausted.
+            assertEquals(EOF, bounded.read());
+        }
+    }
+
+    @Test
+    void testRetainRemainingOverLimitWithArrayReads() throws Exception {
+        final byte[] data = { 1, 2, 3, 4, 5 };
+        try (BoundedInputStream bounded = BoundedInputStream.builder()
+                .setInputStream(new ByteArrayInputStream(data))
+                .setMaxCount(3)
+                .setRetainRemaining(true)
+                .get()) {
+            // One bulk read requests more than the limit but only the allowance is returned.
+            final byte[] head = new byte[10];
+            final int n = bounded.read(head);
+            assertEquals(3, n);
+            assertArrayEquals(new byte[] { 1, 2, 3 }, Arrays.copyOf(head, n));
+            assertTrue(bounded.isOverLimit());
+            // The remaining view starts with the probed fourth byte through the bulk-read path as well.
+            final byte[] tail = new byte[10];
+            try (InputStream remaining = bounded.getRemainingStream()) {
+                final int m = remaining.read(tail);
+                assertEquals(2, m);
+                assertArrayEquals(new byte[] { 4, 5 }, Arrays.copyOf(tail, m));
+            }
         }
     }
 }

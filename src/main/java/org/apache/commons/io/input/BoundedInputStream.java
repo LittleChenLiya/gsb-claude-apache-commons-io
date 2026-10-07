@@ -82,6 +82,29 @@ import org.apache.commons.io.function.IOBiConsumer;
  *   .get();
  * }
  * </pre>
+ * <h2>Retaining the bytes past the limit</h2>
+ * <p>
+ * By default, this stream simply reports end of file once the limit is reached and any extra bytes stay in the underlying stream. When you need to tell
+ * apart "the limit was reached" from "the underlying stream ended", set {@link Builder#setRetainRemaining(boolean)} to {@code true}. In this mode, the
+ * first read blocked by the limit probes a single extra byte from the underlying stream: {@link #isOverLimit()} then reports {@code true}, and the
+ * probed byte (followed by the rest of the underlying stream) is available through {@link #getRemainingStream()}. Closing this stream never closes the
+ * borrowed underlying stream in this mode.
+ * </p>
+ * <pre>{@code
+ * InputStream in = ...;
+ * BoundedInputStream s = BoundedInputStream.builder()
+ *   .setInputStream(in)
+ *   .setMaxCount(3)
+ *   .setRetainRemaining(true)
+ *   .get();
+ * byte[] head = IOUtils.toByteArray(s); // at most 3 bytes
+ * if (s.isOverLimit()) {
+ *   try (InputStream tail = s.getRemainingStream()) {
+ *     // 'tail' starts with the byte that was probed while detecting the overflow.
+ *   }
+ * }
+ * }
+ * </pre>
  *
  * @see Builder
  * @since 2.0
@@ -107,6 +130,9 @@ public class BoundedInputStream extends ProxyInputStream {
         /** Flag if {@link #close()} should be propagated, {@code true} by default. */
         private boolean propagateClose = true;
 
+        /** Whether bytes past the limit are retained and retrievable through a remaining stream. */
+        private boolean retainRemaining;
+
         long getCount() {
             return count;
         }
@@ -121,6 +147,10 @@ public class BoundedInputStream extends ProxyInputStream {
 
         boolean isPropagateClose() {
             return propagateClose;
+        }
+
+        boolean isRetainRemaining() {
+            return retainRemaining;
         }
 
         /**
@@ -186,6 +216,34 @@ public class BoundedInputStream extends ProxyInputStream {
          */
         public T setPropagateClose(final boolean propagateClose) {
             this.propagateClose = propagateClose;
+            return asThis();
+        }
+
+        /**
+         * Sets whether to retain the bytes past the maximum count so they can be detected and retrieved.
+         * <p>
+         * When {@code true}, a read blocked by {@link #setMaxCount(long)} probes one extra byte from the underlying stream to distinguish a reached limit
+         * from the end of the underlying stream. The probed byte and the following bytes are available from {@link BoundedInputStream#getRemainingStream()},
+         * and {@link BoundedInputStream#isOverLimit()} reports whether the limit was exceeded. {@link #mark(int)} and {@link #reset()} save and restore
+         * this detection state along with the read count.
+         * </p>
+         * <p>
+         * Because the underlying stream is borrowed and must remain usable for the remaining stream, setting this to {@code true} forces
+         * {@link #setPropagateClose(boolean)} to {@code false}: closing the built stream never closes the underlying stream.
+         * </p>
+         * <p>
+         * Default is {@code false}, which preserves the classic {@link BoundedInputStream} behavior.
+         * </p>
+         *
+         * @param retainRemaining {@code true} to retain and expose the bytes past the maximum count.
+         * @return {@code this} instance.
+         * @since 2.23.0
+         */
+        public T setRetainRemaining(final boolean retainRemaining) {
+            this.retainRemaining = retainRemaining;
+            if (retainRemaining) {
+                this.propagateClose = false;
+            }
             return asThis();
         }
 
@@ -269,6 +327,7 @@ public class BoundedInputStream extends ProxyInputStream {
          * <li>{@code #getMaxCount()}</li>
          * <li>{@code #getOnMaxCount()}</li>
          * <li>{@code #isPropagateClose()}</li>
+         * <li>{@code #isRetainRemaining()}</li>
          * </ul>
          *
          * @return A new instance.
@@ -301,6 +360,9 @@ public class BoundedInputStream extends ProxyInputStream {
     /** The current mark. */
     private long mark;
 
+    /** The probed byte saved by a mark(int), -1 means no byte was saved. */
+    private int markPushedByte = EOF;
+
     /** The maximum count of bytes to read. */
     private final long maxCount;
 
@@ -313,11 +375,22 @@ public class BoundedInputStream extends ProxyInputStream {
      */
     private boolean propagateClose = true;
 
+    /**
+     * The single byte probed past the limit while detecting an overflow.
+     *
+     * {@link IOUtils#EOF} means no byte has been probed. Only used when {@link #retainRemaining} is {@code true}.
+     */
+    private int pushedByte = EOF;
+
+    /** Whether the bytes past the limit are retained and retrievable through {@link #getRemainingStream()}. */
+    private final boolean retainRemaining;
+
     private BoundedInputStream(final Builder builder) throws IOException {
         super(builder);
         this.count = builder.getCount();
         this.maxCount = builder.getMaxCount();
-        this.propagateClose = builder.isPropagateClose();
+        this.retainRemaining = builder.isRetainRemaining();
+        this.propagateClose = !retainRemaining && builder.isPropagateClose();
         this.onMaxCount = builder.getOnMaxCount();
     }
 
@@ -339,7 +412,8 @@ public class BoundedInputStream extends ProxyInputStream {
         super(inputStream, builder);
         this.count = builder.getCount();
         this.maxCount = builder.getMaxCount();
-        this.propagateClose = builder.isPropagateClose();
+        this.retainRemaining = builder.isRetainRemaining();
+        this.propagateClose = !retainRemaining && builder.isPropagateClose();
         this.onMaxCount = builder.getOnMaxCount();
     }
 
@@ -441,8 +515,56 @@ public class BoundedInputStream extends ProxyInputStream {
         return maxCount == EOF ? Long.MAX_VALUE : Math.max(0, maxCount - getCount());
     }
 
+    /**
+     * Gets an input stream over the bytes past the maximum count.
+     * <p>
+     * The returned stream starts with the extra byte probed while detecting an overflow (if any), followed by the rest of the underlying stream. It shares
+     * the underlying stream with this instance, so reading it advances the underlying position for both.
+     * </p>
+     * <p>
+     * The returned stream does <strong>not</strong> close the underlying stream when closed itself; the caller owns the borrowed underlying stream.
+     * </p>
+     * <p>
+     * This stream itself is unaffected by the returned view: reading past the limit through it still reports end of file.
+     * </p>
+     *
+     * @return an input stream over the bytes past the maximum count.
+     * @throws UnsupportedOperationException if this stream was not built with {@link Builder#setRetainRemaining(boolean)}.
+     * @since 2.23.0
+     */
+    public InputStream getRemainingStream() {
+        if (!retainRemaining) {
+            throw new UnsupportedOperationException("Use Builder.setRetainRemaining(true) to enable the remaining input stream.");
+        }
+        return new RemainingInputStream();
+    }
+
     private boolean isMaxCount() {
         return maxCount >= 0 && getCount() >= maxCount;
+    }
+
+    /**
+     * Tests whether more bytes than the maximum count are available in the underlying stream.
+     * <p>
+     * When this stream has reached its limit, this method probes at most one extra byte from the underlying stream to distinguish a reached limit from the
+     * natural end of the underlying stream. The probed byte is retained and returned first by {@link #getRemainingStream()}. Calling this method more than
+     * once does not probe additional bytes.
+     * </p>
+     *
+     * @return {@code true} if the underlying stream contains bytes past the limit.
+     * @throws IOException Thrown if an I/O error occurs probing the underlying stream.
+     * @throws UnsupportedOperationException if this stream was not built with {@link Builder#setRetainRemaining(boolean)}.
+     * @since 2.23.0
+     */
+    public synchronized boolean isOverLimit() throws IOException {
+        if (!retainRemaining) {
+            throw new UnsupportedOperationException("Use Builder.setRetainRemaining(true) to enable over-limit detection.");
+        }
+        if (!isMaxCount()) {
+            return false;
+        }
+        probeOverLimit();
+        return pushedByte != EOF;
     }
 
     /**
@@ -455,7 +577,20 @@ public class BoundedInputStream extends ProxyInputStream {
     }
 
     /**
+     * Tests whether this instance retains the bytes past the limit for {@link #isOverLimit()} and {@link #getRemainingStream()}.
+     *
+     * @return {@code true} if the bytes past the limit are retained and retrievable.
+     * @since 2.23.0
+     */
+    public boolean isRetainRemaining() {
+        return retainRemaining;
+    }
+
+    /**
      * Invokes the delegate's {@link InputStream#mark(int)} method.
+     * <p>
+     * The over-limit detection state is saved along with the read count and is restored by {@link #reset()}.
+     * </p>
      *
      * @param readLimit read ahead limit.
      */
@@ -463,6 +598,7 @@ public class BoundedInputStream extends ProxyInputStream {
     public synchronized void mark(final int readLimit) {
         in.mark(readLimit);
         mark = count;
+        markPushedByte = pushedByte;
     }
 
     /**
@@ -502,6 +638,9 @@ public class BoundedInputStream extends ProxyInputStream {
     public int read() throws IOException {
         if (isMaxCount()) {
             onMaxLength(maxCount, getCount());
+            if (retainRemaining) {
+                probeOverLimit();
+            }
             return EOF;
         }
         return super.read();
@@ -532,13 +671,31 @@ public class BoundedInputStream extends ProxyInputStream {
     public int read(final byte[] b, final int off, final int len) throws IOException {
         if (isMaxCount()) {
             onMaxLength(maxCount, getCount());
+            if (retainRemaining) {
+                probeOverLimit();
+            }
             return EOF;
         }
         return super.read(b, off, (int) toReadLen(len));
     }
 
     /**
+     * Probes the single byte past the limit, at most once until {@link #reset()} restores a prior state.
+     *
+     * @throws IOException Thrown if an I/O error occurs probing the underlying stream.
+     */
+    private synchronized void probeOverLimit() throws IOException {
+        if (pushedByte == EOF) {
+            // Read the delegate directly: the probe byte must not count towards getCount().
+            pushedByte = in.read();
+        }
+    }
+
+    /**
      * Invokes the delegate's {@link InputStream#reset()} method.
+     * <p>
+     * Restores the over-limit detection state saved by {@link #mark(int)} along with the read count.
+     * </p>
      *
      * @throws IOException Thrown if an I/O error occurs.
      */
@@ -546,6 +703,7 @@ public class BoundedInputStream extends ProxyInputStream {
     public synchronized void reset() throws IOException {
         in.reset();
         count = mark;
+        pushedByte = markPushedByte;
     }
 
     /**
@@ -557,7 +715,8 @@ public class BoundedInputStream extends ProxyInputStream {
      */
     @Deprecated
     public synchronized void setPropagateClose(final boolean propagateClose) {
-        this.propagateClose = propagateClose;
+        // In retain-remaining mode the borrowed underlying stream must stay open for getRemainingStream().
+        this.propagateClose = propagateClose && !retainRemaining;
     }
 
     /**
@@ -595,5 +754,58 @@ public class BoundedInputStream extends ProxyInputStream {
     @Override
     public String toString() {
         return in.toString();
+    }
+
+    /**
+     * Reads the bytes past the limit of the enclosing stream.
+     * <p>
+     * The first byte returned is the byte probed while detecting the overflow; subsequent bytes come straight from the underlying stream. Closing this
+     * stream does not close the borrowed underlying stream.
+     * </p>
+     */
+    private final class RemainingInputStream extends InputStream {
+
+        @Override
+        public int available() throws IOException {
+            synchronized (BoundedInputStream.this) {
+                return (pushedByte != EOF ? 1 : 0) + in.available();
+            }
+        }
+
+        @Override
+        public void close() {
+            // The underlying stream is borrowed and owned by the caller; do not propagate close.
+        }
+
+        @Override
+        public int read() throws IOException {
+            synchronized (BoundedInputStream.this) {
+                if (pushedByte != EOF) {
+                    final int b = pushedByte;
+                    pushedByte = EOF;
+                    return b;
+                }
+                return in.read();
+            }
+        }
+
+        @Override
+        public int read(final byte[] b, final int off, final int len) throws IOException {
+            if (len == 0) {
+                return 0;
+            }
+            synchronized (BoundedInputStream.this) {
+                if (pushedByte == EOF) {
+                    return in.read(b, off, len);
+                }
+                b[off] = (byte) pushedByte;
+                pushedByte = EOF;
+                if (len == 1) {
+                    return 1;
+                }
+                final int n = in.read(b, off + 1, len - 1);
+                return n == EOF ? 1 : n + 1;
+            }
+        }
     }
 }
