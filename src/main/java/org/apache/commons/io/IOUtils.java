@@ -55,6 +55,7 @@ import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -86,6 +87,7 @@ import org.apache.commons.io.output.UnsynchronizedByteArrayOutputStream;
  * <li>write - these methods write data to a stream</li>
  * <li>copy - these methods copy all the data from one stream to another</li>
  * <li>contentEquals - these methods compare the content of two streams</li>
+ * <li>firstDifference - finds the first difference between the content of two streams</li>
  * </ul>
  * <p>
  * The byte-to-char methods and char-to-byte methods involve a conversion step. Two methods are provided in each case, one that uses the platform default
@@ -1351,6 +1353,67 @@ public class IOUtils {
             return false;
         }
         return contentEqualsIgnoreEOL(toBufferedReader(reader1), toBufferedReader(reader2));
+    }
+
+    /**
+     * Finds the first difference between the contents of two {@link InputStream}s.
+     * <p>
+     * The streams are compared byte by byte, so callers may wrap the inputs in streams that perform short reads of
+     * differing sizes without affecting the result. The returned {@link StreamDifference} reports the zero-based byte
+     * offset of the first difference along with the unsigned byte value read from each side; a side that has already
+     * reached its end of stream is reported as {@link StreamDifference#EOF}. An empty {@link Optional} is returned
+     * when both streams contain the same bytes and end together.
+     * </p>
+     * <p>
+     * A {@code null} input is treated as an immediately exhausted (empty) stream. This method does not close either
+     * stream; closing remains the caller's responsibility.
+     * </p>
+     *
+     * @param input1 The first stream, may be {@code null}.
+     * @param input2 The second stream, may be {@code null}.
+     * @return The first difference found, or an empty {@link Optional} if the contents are equal.
+     * @throws StreamReadException if either stream throws an {@link IOException} while reading; the exception records
+     *         the failing {@link StreamReadException.Side}, the byte offset, and the original failure as its cause.
+     * @throws IOException if an I/O error occurs.
+     * @since 2.23.0
+     */
+    public static Optional<StreamDifference> firstDifference(final InputStream input1, final InputStream input2) throws IOException {
+        if (input1 == input2) {
+            return Optional.empty();
+        }
+        long offset = 0;
+        for (;;) {
+            final int value1 = readByte(input1, StreamReadException.Side.FIRST, offset);
+            final int value2 = readByte(input2, StreamReadException.Side.SECOND, offset);
+            if (value1 != value2) {
+                return Optional.of(new StreamDifference(offset, value1, value2));
+            }
+            if (value1 == StreamDifference.EOF) {
+                return Optional.empty();
+            }
+            offset++;
+        }
+    }
+
+    /**
+     * Reads a single byte from a stream for {@link #firstDifference(InputStream, InputStream)}, mapping a
+     * {@code null} stream to EOF and wrapping read failures in a {@link StreamReadException}.
+     *
+     * @param input The stream to read, may be {@code null}.
+     * @param side Which side of the comparison this stream is on.
+     * @param offset The current byte offset.
+     * @return The unsigned byte value read, or {@link StreamDifference#EOF} at end of stream.
+     * @throws StreamReadException if the stream throws an {@link IOException}.
+     */
+    private static int readByte(final InputStream input, final StreamReadException.Side side, final long offset) throws StreamReadException {
+        if (input == null) {
+            return StreamDifference.EOF;
+        }
+        try {
+            return input.read();
+        } catch (final IOException e) {
+            throw new StreamReadException(side, offset, e);
+        }
     }
 
     /**
